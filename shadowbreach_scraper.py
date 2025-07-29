@@ -1,9 +1,9 @@
 import praw
 import requests
 from bs4 import BeautifulSoup
-import sqlite3
-import time
-import datetime
+import os
+import json
+from datetime import datetime
 
 # --- Leak Keywords ---
 LEAK_KEYWORDS = [
@@ -12,40 +12,20 @@ LEAK_KEYWORDS = [
     "authorization", "credentials", "db_dump", "leak"
 ]
 
-# --- SQLite Setup ---
-def init_db():
-    conn = sqlite3.connect("shadowbreach.db")
-    cursor = conn.cursor()
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS leaks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        platform TEXT,
-        source TEXT,
-        content TEXT,
-        fetched_at TEXT
-    )
-    ''')
-    conn.commit()
-    return conn, cursor
-
-def save_to_db(cursor, conn, results):
-    for entry in results:
-        cursor.execute('''
-            INSERT INTO leaks (platform, source, content, fetched_at)
-            VALUES (?, ?, ?, ?)
-        ''', (
-            entry['platform'],
-            entry.get('url', entry.get('source', 'unknown')),
-            entry['content'][:10000],
-            entry['timestamp']
-        ))
-    conn.commit()
+# --- Save Results to JSON File ---
+def save_results_to_file(results):
+    os.makedirs("results", exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    file_path = f"results/leaks_{timestamp}.json"
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"💾 Saved results to {file_path}")
 
 # --- Reddit Scraper ---
 def fetch_reddit():
     reddit = praw.Reddit(
-        client_id="YOUR_CLIENT_ID",
-        client_secret="YOUR_CLIENT_SECRET",
+        client_id=os.getenv("REDDIT_CLIENT_ID", ""),
+        client_secret=os.getenv("REDDIT_CLIENT_SECRET", ""),
         user_agent="shadowbreach-scraper"
     )
     subs = ["netsec", "hacking"]
@@ -56,31 +36,36 @@ def fetch_reddit():
             if any(k in combined for k in LEAK_KEYWORDS):
                 results.append({
                     "platform": "reddit",
-                    "url": post.url,
+                    "source": post.url,
                     "content": post.title + "\n\n" + post.selftext,
-                    "timestamp": datetime.datetime.utcfromtimestamp(post.created_utc).isoformat()
+                    "timestamp": datetime.utcfromtimestamp(post.created_utc).isoformat() + "Z"
                 })
     return results
 
 # --- GitHub Gists Scraper ---
 def fetch_github_gists():
     results = []
-    response = requests.get("https://api.github.com/gists/public")
-    if response.status_code != 200:
-        return results
-    for gist in response.json():
-        for file_info in gist.get("files", {}).values():
-            try:
-                raw = requests.get(file_info["raw_url"], timeout=5).text.lower()
-                if any(k in raw for k in LEAK_KEYWORDS):
-                    results.append({
-                        "platform": "github",
-                        "url": gist["html_url"],
-                        "content": raw,
-                        "timestamp": gist["created_at"]
-                    })
-            except:
-                continue
+    try:
+        response = requests.get("https://api.github.com/gists/public", timeout=10)
+        if response.status_code != 200:
+            print("⚠️ GitHub API error:", response.status_code)
+            return results
+
+        for gist in response.json():
+            for file_info in gist.get("files", {}).values():
+                try:
+                    raw = requests.get(file_info["raw_url"], timeout=5).text.lower()
+                    if any(k in raw for k in LEAK_KEYWORDS):
+                        results.append({
+                            "platform": "github",
+                            "source": gist["html_url"],
+                            "content": raw[:10000],  # Optional truncation
+                            "timestamp": gist["created_at"]
+                        })
+                except:
+                    continue
+    except Exception as e:
+        print("❌ GitHub fetch failed:", e)
     return results
 
 # --- Pastebin Scraper ---
@@ -90,21 +75,22 @@ def fetch_pastebin():
     results = []
 
     try:
-        soup = BeautifulSoup(requests.get(ARCHIVE_URL).text, "html.parser")
+        soup = BeautifulSoup(requests.get(ARCHIVE_URL, timeout=10).text, "html.parser")
         pastes = soup.select("table.maintable tr td a")[:10]
     except:
+        print("⚠️ Failed to load Pastebin archive.")
         return results
 
     for a in pastes:
         paste_url = BASE_URL + a['href']
         try:
-            text = requests.get(paste_url).text.lower()
+            text = requests.get(paste_url, timeout=5).text.lower()
             if any(k in text for k in LEAK_KEYWORDS):
                 results.append({
                     "platform": "pastebin",
-                    "url": paste_url,
-                    "content": text,
-                    "timestamp": datetime.datetime.utcnow().isoformat()
+                    "source": paste_url,
+                    "content": text[:10000],
+                    "timestamp": datetime.utcnow().isoformat() + "Z"
                 })
         except:
             continue
@@ -112,31 +98,28 @@ def fetch_pastebin():
 
 # --- Main ---
 if __name__ == "__main__":
-    print("🚀 ShadowBreach Scraper Starting...")
-    conn, cursor = init_db()
+    print("🚀 ShadowBreach Scraper Running...")
 
     all_results = []
 
     print("🔎 Scraping Reddit...")
     reddit_results = fetch_reddit()
-    print(f"✅ Reddit: {len(reddit_results)} results")
+    print(f"✅ Reddit: {len(reddit_results)} leaks found")
     all_results.extend(reddit_results)
 
     print("🔎 Scraping GitHub Gists...")
     github_results = fetch_github_gists()
-    print(f"✅ GitHub: {len(github_results)} results")
+    print(f"✅ GitHub: {len(github_results)} leaks found")
     all_results.extend(github_results)
 
     print("🔎 Scraping Pastebin...")
     pastebin_results = fetch_pastebin()
-    print(f"✅ Pastebin: {len(pastebin_results)} results")
+    print(f"✅ Pastebin: {len(pastebin_results)} leaks found")
     all_results.extend(pastebin_results)
 
     if all_results:
-        print(f"💾 Saving {len(all_results)} items to DB...")
-        save_to_db(cursor, conn, all_results)
+        save_results_to_file(all_results)
     else:
-        print("⚠️ No matching content found.")
+        print("⚠️ No leaks detected this run.")
 
-    conn.close()
-    print("✅ Done.")
+    print("✅ Scraper finished.")
